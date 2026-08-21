@@ -41,7 +41,7 @@ const brl = (cents: number) =>
 
 export function buildNotifications(event: TransferCompleted): Notification[] {
   const amount = brl(event.payload.amountCents);
-  const note = event.payload.description ? ` (${event.payload.description})` : "";
+  const note = event.payload.description ? ` — "${event.payload.description}"` : "";
   return [
     {
       accountId: event.payload.debitAccountId,
