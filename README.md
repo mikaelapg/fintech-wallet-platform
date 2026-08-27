@@ -1,45 +1,40 @@
 # Fintech Wallet Platform
 
+**English** · [Português](README.pt-BR.md)
+
 [![CI](https://github.com/mikaelapg/fintech-wallet-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/mikaelapg/fintech-wallet-platform/actions/workflows/ci.yml)
 ![Node.js](https://img.shields.io/badge/Node.js-22-339933?logo=nodedotjs&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
-![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.13-FF6600?logo=rabbitmq&logoColor=white)
+![RabbitMQ](https://img.shields.io/badge/RabbitMQ-FF6600?logo=rabbitmq&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-ready-326CE5?logo=kubernetes&logoColor=white)
 
-A digital wallet where users hold a BRL balance and send money to each other — built around the problems that actually matter when software moves money: **correctness under concurrency, exactly-once effects on retries, and never losing an event**.
+A digital wallet: users sign up, get a BRL account, deposit money and send transfers to each other by email.
 
-> Money is moved through a **double-entry ledger**, transfers are **idempotent**, balances **can't go negative even with 20 requests racing**, and events reach other services through a **transactional outbox**. Every one of these guarantees is covered by an automated test against a real PostgreSQL and Redis.
-
----
+I built it to practice the parts of payment systems that are easy to get wrong: two requests touching the same balance at the same time, a client retrying a request that already went through, and an event that has to reach another service even if something crashes halfway.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    U([User]) --> W[Web<br/>React + TS]
-    W -->|/api| A[API<br/>Fastify + TS]
-    A -->|ledger, outbox<br/>one ACID transaction| P[(PostgreSQL)]
-    A -->|cache, rate limit,<br/>idempotency lock| R[(Redis)]
-    O[Outbox Relay] -->|SKIP LOCKED batches| P
-    O -->|publisher confirms| MQ{{RabbitMQ<br/>wallet.events}}
+    U([User]) --> W[Web<br/>React]
+    W -->|/api| A[API<br/>Fastify]
+    A --> P[(PostgreSQL)]
+    A --> R[(Redis)]
+    O[Outbox relay] --> P
+    O --> MQ{{RabbitMQ}}
     MQ --> N[Notifier]
-    N -->|dedupe by event id| R
-    N -.->|retry with backoff| MQ
-    N -.->|poison messages| DLQ[(DLQ)]
+    N --> R
+    N -.-> DLQ[(Dead-letter queue)]
 ```
 
-| Component | Responsibility |
-|---|---|
-| `apps/api` | REST API: auth (JWT), balance, statement, deposits, transfers. Owns the ledger. |
-| `apps/api` · `relay` | Second process from the same image. Reads the outbox and publishes to RabbitMQ. |
-| `apps/notifier` | Consumes `transfer.completed` and notifies sender and recipient. Idempotent, retries with exponential backoff, dead-letters poison messages. |
-| `apps/web` | React SPA: sign up / login, balance, transfer form, infinite-scroll statement. |
-| `k8s/` | Deployments with probes, HPA, PDB, rolling updates, hardened security contexts. |
+- **api**: REST API with auth, balance, statement, deposits and transfers. It owns the ledger.
+- **relay**: a second process built from the API image. It reads pending events from the database and publishes them to RabbitMQ.
+- **notifier**: consumes `transfer.completed` events and notifies sender and recipient.
+- **web**: React app with login, balance, transfer form and statement.
 
-## How a transfer works
+## How a transfer is processed
 
 ```mermaid
 sequenceDiagram
@@ -47,54 +42,51 @@ sequenceDiagram
     participant A as API
     participant R as Redis
     participant P as PostgreSQL
-    C->>A: POST /transfers (Idempotency-Key)
-    A->>P: key already used? → replay original response
-    A->>R: SET idem:lock NX PX 30s
-    A->>P: BEGIN
-    A->>P: SELECT both accounts ORDER BY id FOR UPDATE
-    A->>P: check funds → insert transaction, 2 ledger entries, outbox event
+    C->>A: POST /transfers + Idempotency-Key
+    A->>P: was this key used before? if so, return the original result
+    A->>R: short lock on the key
+    A->>P: BEGIN, lock both accounts (ordered by id)
+    A->>P: check balance, write transaction, 2 ledger entries and outbox event
     A->>P: COMMIT
-    A->>R: invalidate cached balances
+    A->>R: clear cached balances
     A-->>C: 201 Created
 ```
 
-## Technical decisions
+## Design decisions
 
-**Double-entry ledger.** Every movement is one transaction with exactly one debit and one credit of the same amount. Balances are denormalized on `accounts` for fast reads, and a test asserts they always equal the sum of ledger entries. `ledger_entries` is append-only, enforced by a database trigger: mistakes are fixed with new transactions, never by editing history.
+**Ledger.** Each operation is stored as a transaction with one debit and one credit of the same amount, like in accounting. The current balance is also kept on the account row so reads are cheap, and there is a test that checks it always matches the sum of the entries. Entries can't be updated or deleted (a trigger blocks it). A mistake would be fixed with a new transaction.
 
-**Integer cents, never floats.** Amounts are `BIGINT` cents end to end. The frontend parses `"1.234,56"` into `123456` with string operations, so `0.1 + 0.2` problems can't happen.
+**Amounts in cents.** All amounts are integers in cents (`BIGINT` in Postgres). The frontend turns what the user types, like `1.234,56`, into `123456` using string parsing, so there's no floating point involved anywhere.
 
-**Concurrency without deadlocks.** Both accounts are locked with `SELECT … FOR UPDATE` in a deterministic order (by id). Opposite transfers A→B and B→A always acquire locks in the same order, so they serialize instead of deadlocking. The database also has a `CHECK (balance_cents >= 0)` as a last line of defense.
+**Concurrency.** A transfer locks both account rows with `SELECT ... FOR UPDATE`, always in the same order (by id). Without the fixed order, a transfer from A to B and another from B to A at the same moment could deadlock. There's also a `CHECK (balance_cents >= 0)` constraint in case a bug ever slips past the code.
 
-**Idempotency in two layers.** Clients send an `Idempotency-Key` header. A short Redis lock rejects concurrent duplicates fast (double clicks, retry storms); the durable guarantee is a `UNIQUE (initiator_user_id, idempotency_key)` constraint, so even if Redis is flushed money never moves twice. Retrying with the same key returns the original result with `Idempotent-Replayed: true`; reusing a key with a different payload returns `422`.
+**Idempotency.** Transfer and deposit requests require an `Idempotency-Key` header. If the same key comes again, the API returns the original transfer instead of moving money again. Redis holds a short lock to reject duplicates arriving at the same time, but the real guarantee is a unique constraint in Postgres, so even losing Redis data can't cause a double transfer. Same key with a different body returns `422`.
 
-**Transactional outbox.** The `transfer.completed` event is inserted in the same database transaction as the money movement. A separate relay publishes it with RabbitMQ publisher confirms. That removes the dual-write problem: no event for a rolled-back transfer, no lost event for a committed one. The relay uses `FOR UPDATE SKIP LOCKED`, so multiple replicas share the work.
+**Outbox.** The event for another service is saved in the same database transaction as the transfer. The relay publishes it later and only marks it as sent after RabbitMQ confirms. This avoids the case where the transfer is saved but the event is lost (or the opposite). The relay uses `FOR UPDATE SKIP LOCKED`, so more than one replica can run without sending the same event twice.
 
-**At-least-once delivery, idempotent consumers.** A relay crash between publish and commit can resend an event, so the notifier deduplicates by event id in Redis. Transient failures are retried with exponential backoff through a TTL retry queue; malformed messages go straight to a dead-letter queue instead of looping forever.
+**Consumer.** Delivery is at least once, so the notifier ignores events it has already processed (it keeps their ids in Redis). Temporary errors are retried with increasing delays. Invalid messages go to a dead-letter queue instead of being retried forever.
 
-**Cache-aside for balances.** Reads hit Redis first (`X-Cache: HIT|MISS`); writes invalidate after commit. The cache is never the source of truth.
+**Cache.** The balance is read from Redis first and the key is deleted after each transfer commits. Postgres is always the source of truth.
 
-**Keyset pagination.** The statement uses `WHERE id < cursor ORDER BY id DESC` on an `(account_id, id DESC)` index, which stays fast on long histories and doesn't skip or repeat rows when new entries arrive.
+**Statement pagination.** It uses a cursor (`WHERE id < cursor`) instead of `OFFSET`, which keeps queries fast on long histories and doesn't skip or repeat items when new ones arrive.
 
-**Security.** bcrypt password hashing with constant-time behavior for unknown emails (no user enumeration), short-lived JWTs, Redis-backed rate limiting (strict on `/auth/login`), Helmet headers, request ids, secrets redacted from logs, non-root containers with read-only filesystems.
+**Security.** Passwords hashed with bcrypt, short-lived JWTs, rate limiting on login, no way to find out if an email is registered from the login response, sensitive fields removed from logs, containers running as non-root.
 
-**Errors as RFC 9457 problem details.** Every error has a stable machine-readable `code`, field-level validation messages and the request id, so the frontend can show friendly messages and support can trace a request.
+**Errors.** Errors follow RFC 9457 (problem details) and always include a `code` the frontend can map to a message, plus the request id for tracing.
 
-## Running locally
+## Running it
 
-Requirements: Docker. For development without containers: Node.js 22 and pnpm 10.
+With Docker:
 
 ```bash
 docker compose up --build
 ```
 
-| URL | What |
-|---|---|
-| http://localhost:8080 | Web app |
-| http://localhost:3333/docs | OpenAPI / Swagger UI |
-| http://localhost:15672 | RabbitMQ management (guest / guest) |
+- Web app: http://localhost:8080
+- API docs (Swagger): http://localhost:3333/docs
+- RabbitMQ panel: http://localhost:15672 (guest / guest)
 
-Development mode with hot reload:
+For development (Node.js 22 and pnpm 10):
 
 ```bash
 cp .env.example .env
@@ -107,33 +99,32 @@ pnpm dev
 ## Tests
 
 ```bash
-pnpm test          # all packages
+pnpm test
 pnpm lint && pnpm typecheck
 ```
 
-API tests are **integration tests against real PostgreSQL and Redis** (no mocks for the database), because the guarantees that matter here — locking, constraints, triggers, isolation — only exist in the real engine. Highlights:
+The API tests run against a real Postgres and Redis instead of mocks, since locks, constraints and triggers only behave like production in the real database. Some of the cases covered:
 
-- 20 concurrent transfers from a R$ 10,00 balance → exactly 10 succeed, balance ends at 0
-- 20 simultaneous opposite transfers → no deadlock, balances preserved
-- 10 parallel requests with the same `Idempotency-Key` → money moves once
-- the ledger stays balanced and matches account balances after a series of transfers
-- ledger entries can't be updated or deleted
-- two outbox relay replicas never publish the same event twice
+- 20 transfers of R$ 1,00 at the same time from an account with R$ 10,00: exactly 10 succeed and the balance ends at zero
+- 20 transfers in opposite directions at the same time: no deadlock, balances stay correct
+- 10 identical requests with the same key at the same time: money moves once
+- after several transfers, the ledger is balanced and matches the account balances
+- two relay replicas running together never publish the same event twice
 
-CI runs lint, typecheck, unit and integration tests, validates Kubernetes manifests with kubeconform and builds the container images.
+The CI pipeline runs lint, type checking, all tests, validates the Kubernetes manifests and builds the Docker images.
 
-## API
+## Endpoints
 
-| Method | Path | Description |
+| Method | Path | |
 |---|---|---|
-| `POST` | `/auth/register` | Create user and wallet account |
-| `POST` | `/auth/login` | Get a JWT |
-| `GET` | `/me` | Current user |
-| `GET` | `/accounts/me/balance` | Balance (cached) |
-| `GET` | `/accounts/me/statement?limit=&cursor=` | Statement, cursor pagination |
-| `POST` | `/accounts/me/deposits` | Simulated cash-in · requires `Idempotency-Key` |
-| `POST` | `/transfers` | Send money by recipient email · requires `Idempotency-Key` |
-| `GET` | `/health/live`, `/health/ready` | Liveness and readiness probes |
+| `POST` | `/auth/register` | Sign up (also creates the account) |
+| `POST` | `/auth/login` | Returns a JWT |
+| `GET` | `/me` | Logged user |
+| `GET` | `/accounts/me/balance` | Balance |
+| `GET` | `/accounts/me/statement` | Statement (`limit`, `cursor`) |
+| `POST` | `/accounts/me/deposits` | Simulated deposit, needs `Idempotency-Key` |
+| `POST` | `/transfers` | Transfer by recipient email, needs `Idempotency-Key` |
+| `GET` | `/health/live`, `/health/ready` | Health checks |
 
 ```bash
 curl -X POST http://localhost:3333/transfers \
@@ -143,23 +134,23 @@ curl -X POST http://localhost:3333/transfers \
   -d '{"recipientEmail":"bob@example.com","amountCents":2590,"description":"Pizza"}'
 ```
 
-## Project structure
+## Structure
 
 ```
 apps/
-  api/        Fastify API, ledger, outbox relay, SQL migrations, integration tests
-  notifier/   RabbitMQ consumer with retry and dead-letter queues
-  web/        React + Vite + TanStack Query + Tailwind
-k8s/          Kustomize manifests (Deployments, HPA, PDB, Ingress)
-.github/      CI pipeline
+  api/        API, ledger, outbox relay, SQL migrations and tests
+  notifier/   RabbitMQ consumer
+  web/        React frontend
+k8s/          Kubernetes manifests
+.github/      CI
 ```
 
-## Next steps
+## What I'd add next
 
-- Distributed tracing with OpenTelemetry across API, relay and notifier
-- Refresh tokens with rotation
-- Scheduled transfers and a reconciliation job comparing ledger and balances
-- Terraform for the AWS infrastructure (RDS, ElastiCache, Amazon MQ, EKS)
+- OpenTelemetry tracing across the three services
+- Refresh tokens
+- A reconciliation job that compares ledger and balances daily
+- Terraform for running it on AWS
 
 ## License
 
