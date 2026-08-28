@@ -35,7 +35,7 @@ export function Dashboard() {
       <section className="card mb-6 bg-linear-to-br from-indigo-600/30 to-slate-900">
         <p className="text-sm text-slate-300">Saldo disponível</p>
         <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-white" aria-live="polite">
-          {balance.data ? formatBRL(balance.data.balanceCents) : "—"}
+          {balance.data ? formatBRL(balance.data.balanceCents) : "..."}
         </p>
         <button
           type="button"

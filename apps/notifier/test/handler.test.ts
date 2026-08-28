@@ -88,6 +88,6 @@ describe("notifier handler", () => {
 
   it("omits the note when the transfer has no description", () => {
     const [sender] = buildNotifications(makeEvent({ description: null }));
-    expect(sender?.body).not.toContain('"');
+    expect(sender?.body.replace(/\s/g, " ")).toBe("Você enviou R$ 123,45.");
   });
 });
